@@ -1,19 +1,29 @@
-
+# ---- Base: slim Python with no CUDA (CPU-only) ----
 FROM python:3.10-slim
 
-# Small system deps
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+# Ensure stdout/stderr are unbuffered (logs appear immediately)
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# Small, necessary OS deps
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
+# ---- Python deps (CPU-only torch + transformers + pandas + gcsfs) ----
+# Torch CPU builds are served from the official url below
+RUN pip install --no-cache-dir \
+      "torch==2.4.1" -f https://download.pytorch.org/whl/cpu/torch_stable.html \
+      "transformers==4.44.2" \
+      "pandas>=2.0,<3.0" \
+      "gcsfs>=2024.0.0"
+
+# ---- App ----
 WORKDIR /app
-
-# CPU-only torch + deps (keep image small)
-RUN pip install --no-cache-dir "torch==2.2.2+cpu" -f https://download.pytorch.org/whl/cpu \
- && pip install --no-cache-dir transformers==4.44.2 pandas
-
-# App
 COPY bdt-sentiment.py /app/bdt-sentiment.py
 
-# Container runs the app; pass --input at runtime
+# Default command prints help unless you pass --input or mount /data
+# We provide a sensible default so a single docker run will execute.
 ENTRYPOINT ["python", "/app/bdt-sentiment.py"]
-CMD ["--help"]
+CMD ["--input", "/data/tweets-sentiment-synth.csv"]
+
