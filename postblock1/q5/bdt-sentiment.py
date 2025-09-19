@@ -1,131 +1,192 @@
 #!/usr/bin/env python3
 """
 bdt-sentiment.py
-- Reads a CSV with columns: text, sentiment
-- If --input starts with gs:// it reads straight from Google Cloud Storage
-- Runs a Hugging Face sentiment model and prints accuracy
+
+Usage:
+  python bdt-sentiment.py --input path/to/tweets.csv
+  python bdt-sentiment.py --input gs://YOUR_BUCKET/tweets.csv    # reads directly from GCS
+
+CSV expectations:
+- One column with the tweet text (named 'text', 'tweet', 'message', or similar)
+- One column with ground-truth sentiment (named 'sentiment', 'label', or 'target')
+  Accepted label values (case-insensitive): negative/0, neutral/1, positive/2
 """
 
 import argparse
 import io
+import os
 import re
-import sys
-from typing import List
+from typing import List, Tuple
 
 import pandas as pd
-from transformers import pipeline
-from google.cloud import storage  # <-- NEW: GCS client
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TextClassificationPipeline,
+)
+import torch
 
 
 # ---------------------------
-# Helpers
+# Model: strong tweet-specific checkpoint
 # ---------------------------
-def _read_csv_from_gcs(gs_url: str) -> pd.DataFrame:
-    """
-    Read CSV directly from GCS 
-    
-    """
-    if not gs_url.startswith("gs://"):
-        raise ValueError(f"Expected gs:// URL, got: {gs_url}")
-
-    m = re.match(r"^gs://([^/]+)/(.+)$", gs_url)
-    if not m:
-        raise ValueError(f"Malformed GCS URL: {gs_url}")
-    bucket_name, blob_name = m.group(1), m.group(2)
-
-    client = storage.Client()                    # Uses ADC (env var or workload identity)
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    csv_bytes = blob.download_as_bytes()         # in-memory
-    return pd.read_csv(io.BytesIO(csv_bytes))    # If your CSV is UTF-8, this is perfect
+MODEL_NAME = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+ID2LABEL = {0: "negative", 1: "neutral", 2: "positive"}
+LABEL2ID = {v: k for k, v in ID2LABEL.items()}
 
 
-def _load_dataframe(path: str) -> pd.DataFrame:
-    if path.startswith("gs://"):
-        return _read_csv_from_gcs(path)
-    return pd.read_csv(path)
+# ---------------------------
+# Utilities
+# ---------------------------
+TEXT_CANDIDATES = ["text", "tweet", "message", "content", "body"]
+LABEL_CANDIDATES = ["sentiment", "label", "target", "y", "class"]
+
+LABEL_NORMALISE = {
+    "neg": "negative",
+    "negative": "negative",
+    "0": "negative",
+    0: "negative",
+    "neu": "neutral",
+    "neutral": "neutral",
+    "1": "neutral",
+    1: "neutral",
+    "pos": "positive",
+    "positive": "positive",
+    "2": "positive",
+    2: "positive",
+}
+
+url_pat = re.compile(r"http\S+|www\.\S+", re.IGNORECASE)
+user_pat = re.compile(r"@\w+")
+hashtag_pat = re.compile(r"#(\w+)")
 
 
-def _normalize_truth(labels: pd.Series) -> List[str]:
-    """
-    Normalize ground-truth strings to one of: negative / neutral / positive
-    """
-    norm = (
-        labels.astype(str)
-        .str.strip()
-        .str.lower()
-        .replace({"neg": "negative", "pos": "positive"})
+def tweet_clean(s: str) -> str:
+    """Light normalisation that helps Twitter models a bit."""
+    s = url_pat.sub("http", s)
+    s = user_pat.sub("@user", s)
+    s = hashtag_pat.sub(r"\1", s)  # remove # but keep the token
+    return s.strip()
+
+
+def find_column(df: pd.DataFrame, candidates: List[str]) -> str:
+    cols = {c.lower(): c for c in df.columns}
+    for name in candidates:
+        if name in cols:
+            return cols[name]
+    # fallback: try fuzzy contains
+    for c in df.columns:
+        lc = c.lower()
+        if any(name in lc for name in candidates):
+            return c
+    raise ValueError(
+        f"Could not find a suitable column among {df.columns.tolist()} for candidates {candidates}"
     )
-    # anything not in the known set becomes neutral (optional)
-    norm = norm.where(norm.isin({"negative", "neutral", "positive"}), other="neutral")
-    return norm.tolist()
 
 
-def _normalize_pred(hf_labels: List[str]) -> List[str]:
-    """
-    Map model outputs to the same three classes.
-    Works with 'cardiffnlp/twitter-roberta-base-sentiment-latest',
-    which returns labels like 'negative', 'neutral', 'positive'
-    or 'LABEL_0/1/2' depending on version.
-    """
-    out = []
-    for lab in hf_labels:
-        l = lab.strip().lower()
-        if l in {"negative", "neutral", "positive"}:
-            out.append(l)
-        elif l in {"label_0", "0"}:
-            out.append("negative")
-        elif l in {"label_1", "1"}:
-            out.append("neutral")
-        elif l in {"label_2", "2"}:
-            out.append("positive")
+def read_csv_anywhere(path: str) -> pd.DataFrame:
+    if path.startswith("gs://"):
+        # read from Google Cloud Storage using google-cloud-storage
+        try:
+            from google.cloud import storage  # lazy import
+        except Exception as e:
+            raise RuntimeError(
+                "Reading from GCS requires the 'google-cloud-storage' package and "
+                "application credentials. Install with 'pip install google-cloud-storage' "
+                "and set GOOGLE_APPLICATION_CREDENTIALS to a service-account JSON."
+            ) from e
+
+        # parse gs://bucket/obj
+        _, _, bucket, *obj_parts = path.split("/")
+        blob_name = "/".join(obj_parts)
+        client = storage.Client()
+        bucket_obj = client.bucket(bucket)
+        blob = bucket_obj.blob(blob_name)
+        data = blob.download_as_bytes()
+        return pd.read_csv(io.BytesIO(data))
+    else:
+        return pd.read_csv(path)
+
+
+def to_standard_label(x) -> str:
+    if isinstance(x, str):
+        key = x.strip().lower()
+    else:
+        key = str(x)
+    if key in LABEL_NORMALISE:
+        return LABEL_NORMALISE[key]
+    # try numeric
+    if key.isdigit():
+        return LABEL_NORMALISE.get(key, None)
+    return None
+
+
+def evaluate(texts: List[str], gold: List[str]) -> Tuple[float, List[str]]:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME, id2label=ID2LABEL, label2id=LABEL2ID
+    )
+
+    device = 0 if torch.cuda.is_available() else -1
+    pipe = TextClassificationPipeline(
+        model=model,
+        tokenizer=tokenizer,
+        device=device,
+        truncation=True,
+        top_k=None,
+        batch_size=32,
+    )
+
+    preds = pipe(texts)
+    # pipeline returns dicts with 'label' and 'score'
+    pred_labels = []
+    for p in preds:
+        # Some versions return 'LABEL_0/1/2' -> map with ID2LABEL if needed
+        lab = p.get("label", "")
+        lab_l = lab.lower()
+        if lab_l in ID2LABEL.values():
+            pred_labels.append(lab_l)
         else:
-            out.append("neutral")
-    return out
+            # handle LABEL_0/1/2
+            if lab_l.startswith("label_"):
+                idx = int(lab_l.split("_")[-1])
+                pred_labels.append(ID2LABEL[idx])
+            else:
+                # last resort
+                pred_labels.append(lab_l)
+
+    correct = sum(1 for a, b in zip(pred_labels, gold) if a == b)
+    acc = correct / max(1, len(gold))
+    return acc, pred_labels
 
 
-# ---------------------------
-# Main
-# ---------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Path to CSV (local or gs://bucket/path.csv)")
-    ap.add_argument("--text_col", default="text", help="Name of text column")
-    ap.add_argument("--label_col", default="sentiment", help="Name of ground-truth column")
-    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--input", required=True, help="CSV path or gs://bucket/file.csv")
     args = ap.parse_args()
 
-    # 1) Load data (local or GCS)
-    df = _load_dataframe(args.input)
-    if args.text_col not in df.columns or args.label_col not in df.columns:
-        print(f"Expected columns '{args.text_col}' and '{args.label_col}' in CSV.", file=sys.stderr)
-        sys.exit(2)
+    df = read_csv_anywhere(args.input)
 
-    texts = df[args.text_col].astype(str).tolist()
-    truth = _normalize_truth(df[args.label_col])
+    text_col = find_column(df, TEXT_CANDIDATES)
+    label_col = find_column(df, LABEL_CANDIDATES)
 
-    # 2) Build pipeline (CPU)
-    clf = pipeline(
-        task="sentiment-analysis",
-        model="cardiffnlp/twitter-roberta-base-sentiment-latest",
-        device=-1,  # CPU
-        truncation=True
-    )
+    # clean & normalise
+    texts = [tweet_clean(str(t)) for t in df[text_col].astype(str).tolist()]
+    gold = [to_standard_label(v) for v in df[label_col].tolist()]
 
-    # 3) Run inference (batched)
-    preds = []
-    for i in range(0, len(texts), args.batch_size):
-        batch = texts[i : i + args.batch_size]
-        out = clf(batch)
-        preds.extend([o["label"] for o in out])
+    # filter out rows with unknown labels
+    keep = [i for i, g in enumerate(gold) if g in {"negative", "neutral", "positive"}]
+    if not keep:
+        raise ValueError(
+            f"No usable labels found in '{label_col}'. Examples seen: "
+            f"{pd.Series(df[label_col]).head(5).tolist()}"
+        )
 
-    # 4) Normalize predictions and compute accuracy
-    pred_norm = _normalize_pred(preds)
-    correct = sum(1 for a, b in zip(pred_norm, truth) if a == b)
-    n = len(truth)
-    acc = correct / n if n else 0.0
+    texts = [texts[i] for i in keep]
+    gold = [gold[i] for i in keep]
 
-    print(f"Accuracy: {acc:.3f} ({acc*100:.1f}%) on {n} tweets")
+    acc, _ = evaluate(texts, gold)
+    print(f"Accuracy: {acc:.4f} ({acc*100:.2f}%) on {len(gold)} tweets")
 
 
 if __name__ == "__main__":
